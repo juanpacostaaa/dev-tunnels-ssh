@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -174,6 +175,107 @@ public class ChannelTests : IDisposable
 					SshChannelOpenFailureReason.ConnectFailed,
 				((SshChannelException)ex).Message);
 		}
+	}
+
+	/// <summary>
+	/// Installs a test hook on the client's internal ConnectionService that deterministically
+	/// reproduces the channel-open cancellation race. The internal hook is reached via
+	/// reflection (as <see cref="ReconnectTests"/> does for KeyRotationThreshold) so the test
+	/// otherwise uses only the public session API. The hook runs on the receive pump thread
+	/// while it holds the ConnectionService lock during open-confirmation processing: it cancels
+	/// the open (whose callback, registered in OpenChannelAsync, also acquires that lock) from
+	/// another thread and then sleeps so the callback is in-flight and blocked on the lock.
+	/// Before the fix, the pump then disposed the cancellation registration while still holding
+	/// the lock, which blocks on the in-flight callback and deadlocks the session; after the fix
+	/// the registration is disposed after the lock is released.
+	/// </summary>
+	private static void InstallOpenCancelRaceHook(
+		SshSession session, CancellationTokenSource cancellationSource)
+	{
+		var connectionServiceType = typeof(SshSession).Assembly.GetType(
+			"Microsoft.DevTunnels.Ssh.Services.ConnectionService");
+		var activateMethod = typeof(SshSession).GetMethods()
+			.Single(m => m.Name == nameof(SshSession.ActivateService) &&
+				m.IsGenericMethodDefinition &&
+				m.GetParameters().Length == 0)
+			.MakeGenericMethod(connectionServiceType);
+		var connectionService = activateMethod.Invoke(session, null);
+
+		var hookProperty = connectionServiceType.GetProperty(
+			"TestHook_ChannelOpenResponseLocked",
+			BindingFlags.NonPublic | BindingFlags.Instance);
+
+		Action hook = () =>
+		{
+			// Fire only once, on the first (raced) open confirmation.
+			hookProperty.SetValue(connectionService, null);
+
+			// Cancel from another thread; the open's cancellation callback then contends for
+			// the ConnectionService lock, which the pump currently holds here.
+			Task.Run(() => cancellationSource.Cancel());
+
+			// Give the cancellation callback time to reach and block on the lock.
+			Thread.Sleep(500);
+		};
+
+		hookProperty.SetValue(connectionService, hook);
+	}
+
+	[Fact]
+	public async Task OpenChannelCancelDuringConfirmationDoesNotDeadlock()
+	{
+		await this.sessionPair.ConnectAsync().WithTimeout(Timeout);
+
+		using var cancellationSource = new CancellationTokenSource();
+		InstallOpenCancelRaceHook(this.clientSession, cancellationSource);
+
+		var openTask = this.clientSession.OpenChannelAsync(
+			(string)null, cancellationSource.Token);
+
+		// Before the fix this times out (the pump thread deadlocks); after the fix the open
+		// completes, whether it ends up cancelled or opened.
+		try
+		{
+			await openTask.WithTimeout(Timeout);
+		}
+		catch (OperationCanceledException)
+		{
+		}
+		catch (SshChannelException)
+		{
+		}
+	}
+
+	[Fact]
+	public async Task SessionRemainsUsableAfterOpenCancelRace()
+	{
+		await this.sessionPair.ConnectAsync().WithTimeout(Timeout);
+
+		using var cancellationSource = new CancellationTokenSource();
+		InstallOpenCancelRaceHook(this.clientSession, cancellationSource);
+
+		var racedOpenTask = this.clientSession.OpenChannelAsync(
+			(string)null, cancellationSource.Token);
+
+		try
+		{
+			await racedOpenTask.WithTimeout(Timeout);
+		}
+		catch (OperationCanceledException)
+		{
+		}
+		catch (SshChannelException)
+		{
+		}
+
+		// If the pump thread had deadlocked, the receive loop could no longer process
+		// messages, so this subsequent open would hang instead of completing end-to-end.
+		var serverChannelTask = this.serverSession.AcceptChannelAsync();
+		var clientChannel = await this.clientSession.OpenChannelAsync().WithTimeout(Timeout);
+		var serverChannel = await serverChannelTask.WithTimeout(Timeout);
+
+		Assert.NotNull(clientChannel);
+		Assert.NotNull(serverChannel);
 	}
 
 	[Theory]

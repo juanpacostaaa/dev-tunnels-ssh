@@ -49,6 +49,14 @@ internal class ConnectionService : SshService
 	private long channelCounter = -1;
 	private Exception? closedException = null;
 
+	/// <summary>
+	/// Test-only hook invoked while holding <see cref="lockObject"/> in the channel-open
+	/// confirmation handler, right before the pending channel's cancellation registration is
+	/// captured. Tests use this to deterministically reproduce the channel-open cancellation
+	/// race. Always null (a no-op) in production.
+	/// </summary>
+	internal Action? TestHook_ChannelOpenResponseLocked { get; set; }
+
 	public ConnectionService(SshSession session) : base(session)
 	{
 		this.channels = new Dictionary<uint, SshChannel>();
@@ -500,6 +508,8 @@ internal class ConnectionService : SshService
 			{
 				openMessage = pendingChannel.OpenMessage;
 				completionSource = pendingChannel.CompletionSource;
+
+				this.TestHook_ChannelOpenResponseLocked?.Invoke();
 
 				// Capture the registration and dispose it AFTER releasing the lock.
 				// Disposing here would deadlock: the callback registered in
