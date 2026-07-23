@@ -183,11 +183,11 @@ public class ChannelTests : IDisposable
 	/// reflection (as <see cref="ReconnectTests"/> does for KeyRotationThreshold) so the test
 	/// otherwise uses only the public session API. The hook runs on the receive pump thread
 	/// while it holds the ConnectionService lock during open-confirmation processing: it cancels
-	/// the open (whose callback, registered in OpenChannelAsync, also acquires that lock) from
-	/// another thread and then sleeps so the callback is in-flight and blocked on the lock.
-	/// Before the fix, the pump then disposed the cancellation registration while still holding
-	/// the lock, which blocks on the in-flight callback and deadlocks the session; after the fix
-	/// the registration is disposed after the lock is released.
+	/// the open from another thread, using CancellationToken LIFO callback ordering to
+	/// deterministically confirm the internal callback is contending for the held lock before
+	/// returning. Before the fix, the pump then disposed the cancellation registration while
+	/// still holding the lock, which blocks on the in-flight callback and deadlocks the session;
+	/// after the fix the registration is disposed after the lock is released.
 	/// </summary>
 	private static void InstallOpenCancelRaceHook(
 		SshSession session, CancellationTokenSource cancellationSource)
@@ -210,12 +210,24 @@ public class ChannelTests : IDisposable
 			// Fire only once, on the first (raced) open confirmation.
 			hookProperty.SetValue(connectionService, null);
 
-			// Cancel from another thread; the open's cancellation callback then contends for
-			// the ConnectionService lock, which the pump currently holds here.
+			// We need the cancellation callback to be actively contending for our held lock
+			// before this hook returns. CancellationToken callbacks fire in LIFO order on the
+			// thread that calls Cancel(). The internal callback (registered in OpenChannelAsync)
+			// was registered BEFORE this one, so ours fires FIRST. Once ours completes,
+			// Cancel() immediately invokes the internal callback on the same thread — which
+			// blocks on lockObject that we hold here. So when callbackStarted completes, the
+			// internal callback is guaranteed to be contending for the lock (same-thread
+			// sequential execution within Cancel(), zero scheduling gap).
+			var callbackStarted = new TaskCompletionSource<bool>(
+				TaskCreationOptions.RunContinuationsAsynchronously);
+
+			// Registered AFTER the internal callback → fires FIRST (LIFO).
+			cancellationSource.Token.Register(() => callbackStarted.SetResult(true));
+
 			Task.Run(() => cancellationSource.Cancel());
 
-			// Give the cancellation callback time to reach and block on the lock.
-			Thread.Sleep(500);
+			// When this returns, the internal callback is already blocked on lockObject.
+			callbackStarted.Task.Wait();
 		};
 
 		hookProperty.SetValue(connectionService, hook);
