@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -174,6 +175,146 @@ public class ChannelTests : IDisposable
 					SshChannelOpenFailureReason.ConnectFailed,
 				((SshChannelException)ex).Message);
 		}
+	}
+
+	/// <summary>
+	/// Installs a test hook on the client's internal ConnectionService that deterministically
+	/// reproduces the channel-open cancellation race. The internal hook is reached via
+	/// reflection (as <see cref="ReconnectTests"/> does for KeyRotationThreshold) so the test
+	/// otherwise uses only the public session API. The hook runs on the receive pump thread
+	/// while it holds the ConnectionService lock during open-confirmation processing: it cancels
+	/// the open from another thread, using a dual-registration handshake to deterministically
+	/// confirm the internal callback is contending for the held lock before returning.
+	/// A monitoring callback is registered both BEFORE and AFTER the internal one (via
+	/// the returned action and inside the hook). CancellationToken callbacks fire in LIFO
+	/// order on .NET Core and FIFO on .NET Framework — so one of the two monitoring
+	/// callbacks always fires before the internal one. Since Cancel() executes callbacks
+	/// sequentially on the calling thread, once the monitoring callback completes, the
+	/// internal callback starts immediately on the same thread and blocks on lockObject.
+	/// Before the fix, the pump then disposed the cancellation registration while still
+	/// holding the lock, which blocks on the in-flight callback and deadlocks the session;
+	/// after the fix the registration is disposed after the lock is released.
+	/// </summary>
+	/// <returns>An action that must be invoked after the hook is installed but before
+	/// OpenChannelAsync, to register the "early" monitoring callback.</returns>
+	private static Action InstallOpenCancelRaceHook(
+		SshSession session,
+		CancellationTokenSource cancellationSource,
+		TaskCompletionSource<bool> callbackStarted)
+	{
+		var connectionServiceType = typeof(SshSession).Assembly.GetType(
+			"Microsoft.DevTunnels.Ssh.Services.ConnectionService");
+		var activateMethod = typeof(SshSession).GetMethods()
+			.Single(m => m.Name == nameof(SshSession.ActivateService) &&
+				m.IsGenericMethodDefinition &&
+				m.GetParameters().Length == 0)
+			.MakeGenericMethod(connectionServiceType);
+		var connectionService = activateMethod.Invoke(session, null);
+
+		var hookProperty = connectionServiceType.GetProperty(
+			"TestHook_ChannelOpenResponseLocked",
+			BindingFlags.NonPublic | BindingFlags.Instance);
+
+		Action hook = () =>
+		{
+			// Fire only once, on the first (raced) open confirmation.
+			hookProperty.SetValue(connectionService, null);
+
+			// Register a "late" monitoring callback — AFTER the internal callback
+			// (which was registered inside OpenChannelAsync). On LIFO runtimes
+			// (.NET Core) this fires first; on FIFO runtimes (.NET Framework) the
+			// "early" callback registered below fires first. Either way, one of them
+			// signals before the internal callback executes.
+			cancellationSource.Token.Register(
+				() => callbackStarted.TrySetResult(true));
+
+			// Cancel on a background thread. Cancel() invokes all registered
+			// callbacks sequentially on its thread before returning.
+			Task.Run(() => cancellationSource.Cancel());
+
+			// Wait for a monitoring callback to fire. Since Cancel() executes
+			// callbacks sequentially, the internal callback starts immediately
+			// after the monitoring one completes — on the same thread — and blocks
+			// on lockObject (which the caller holds). So when Wait() returns, the
+			// internal callback is guaranteed to be contending for the lock.
+			callbackStarted.Task.Wait();
+		};
+
+		hookProperty.SetValue(connectionService, hook);
+
+		// Return an action the caller must invoke BEFORE OpenChannelAsync to register
+		// the "early" monitoring callback (covers FIFO runtimes like .NET Framework).
+		return () => cancellationSource.Token.Register(
+			() => callbackStarted.TrySetResult(true));
+	}
+
+	[Fact]
+	public async Task OpenChannelCancelDuringConfirmationDoesNotDeadlock()
+	{
+		await this.sessionPair.ConnectAsync().WithTimeout(Timeout);
+
+		using var cancellationSource = new CancellationTokenSource();
+		var callbackStarted = new TaskCompletionSource<bool>(
+			TaskCreationOptions.RunContinuationsAsynchronously);
+		var registerEarlyCallback = InstallOpenCancelRaceHook(
+			this.clientSession, cancellationSource, callbackStarted);
+
+		// Register "early" monitoring callback BEFORE OpenChannelAsync registers
+		// the internal one. On FIFO (.NET Framework) this fires first.
+		registerEarlyCallback();
+
+		var openTask = this.clientSession.OpenChannelAsync(
+			(string)null, cancellationSource.Token);
+
+		// Before the fix this times out (the pump thread deadlocks); after the fix the open
+		// completes, whether it ends up cancelled or opened.
+		try
+		{
+			await openTask.WithTimeout(Timeout);
+		}
+		catch (OperationCanceledException)
+		{
+		}
+		catch (SshChannelException)
+		{
+		}
+	}
+
+	[Fact]
+	public async Task SessionRemainsUsableAfterOpenCancelRace()
+	{
+		await this.sessionPair.ConnectAsync().WithTimeout(Timeout);
+
+		using var cancellationSource = new CancellationTokenSource();
+		var callbackStarted = new TaskCompletionSource<bool>(
+			TaskCreationOptions.RunContinuationsAsynchronously);
+		var registerEarlyCallback = InstallOpenCancelRaceHook(
+			this.clientSession, cancellationSource, callbackStarted);
+
+		registerEarlyCallback();
+
+		var racedOpenTask = this.clientSession.OpenChannelAsync(
+			(string)null, cancellationSource.Token);
+
+		try
+		{
+			await racedOpenTask.WithTimeout(Timeout);
+		}
+		catch (OperationCanceledException)
+		{
+		}
+		catch (SshChannelException)
+		{
+		}
+
+		// If the pump thread had deadlocked, the receive loop could no longer process
+		// messages, so this subsequent open would hang instead of completing end-to-end.
+		var serverChannelTask = this.serverSession.AcceptChannelAsync();
+		var clientChannel = await this.clientSession.OpenChannelAsync().WithTimeout(Timeout);
+		var serverChannel = await serverChannelTask.WithTimeout(Timeout);
+
+		Assert.NotNull(clientChannel);
+		Assert.NotNull(serverChannel);
 	}
 
 	[Theory]
