@@ -183,14 +183,24 @@ public class ChannelTests : IDisposable
 	/// reflection (as <see cref="ReconnectTests"/> does for KeyRotationThreshold) so the test
 	/// otherwise uses only the public session API. The hook runs on the receive pump thread
 	/// while it holds the ConnectionService lock during open-confirmation processing: it cancels
-	/// the open from another thread, using CancellationToken LIFO callback ordering to
-	/// deterministically confirm the internal callback is contending for the held lock before
-	/// returning. Before the fix, the pump then disposed the cancellation registration while
-	/// still holding the lock, which blocks on the in-flight callback and deadlocks the session;
+	/// the open from another thread, using a dual-registration handshake to deterministically
+	/// confirm the internal callback is contending for the held lock before returning.
+	/// A monitoring callback is registered both BEFORE and AFTER the internal one (via
+	/// the returned action and inside the hook). CancellationToken callbacks fire in LIFO
+	/// order on .NET Core and FIFO on .NET Framework — so one of the two monitoring
+	/// callbacks always fires before the internal one. Since Cancel() executes callbacks
+	/// sequentially on the calling thread, once the monitoring callback completes, the
+	/// internal callback starts immediately on the same thread and blocks on lockObject.
+	/// Before the fix, the pump then disposed the cancellation registration while still
+	/// holding the lock, which blocks on the in-flight callback and deadlocks the session;
 	/// after the fix the registration is disposed after the lock is released.
 	/// </summary>
-	private static void InstallOpenCancelRaceHook(
-		SshSession session, CancellationTokenSource cancellationSource)
+	/// <returns>An action that must be invoked after the hook is installed but before
+	/// OpenChannelAsync, to register the "early" monitoring callback.</returns>
+	private static Action InstallOpenCancelRaceHook(
+		SshSession session,
+		CancellationTokenSource cancellationSource,
+		TaskCompletionSource<bool> callbackStarted)
 	{
 		var connectionServiceType = typeof(SshSession).Assembly.GetType(
 			"Microsoft.DevTunnels.Ssh.Services.ConnectionService");
@@ -210,27 +220,32 @@ public class ChannelTests : IDisposable
 			// Fire only once, on the first (raced) open confirmation.
 			hookProperty.SetValue(connectionService, null);
 
-			// We need the cancellation callback to be actively contending for our held lock
-			// before this hook returns. CancellationToken callbacks fire in LIFO order on the
-			// thread that calls Cancel(). The internal callback (registered in OpenChannelAsync)
-			// was registered BEFORE this one, so ours fires FIRST. Once ours completes,
-			// Cancel() immediately invokes the internal callback on the same thread — which
-			// blocks on lockObject that we hold here. So when callbackStarted completes, the
-			// internal callback is guaranteed to be contending for the lock (same-thread
-			// sequential execution within Cancel(), zero scheduling gap).
-			var callbackStarted = new TaskCompletionSource<bool>(
-				TaskCreationOptions.RunContinuationsAsynchronously);
+			// Register a "late" monitoring callback — AFTER the internal callback
+			// (which was registered inside OpenChannelAsync). On LIFO runtimes
+			// (.NET Core) this fires first; on FIFO runtimes (.NET Framework) the
+			// "early" callback registered below fires first. Either way, one of them
+			// signals before the internal callback executes.
+			cancellationSource.Token.Register(
+				() => callbackStarted.TrySetResult(true));
 
-			// Registered AFTER the internal callback → fires FIRST (LIFO).
-			cancellationSource.Token.Register(() => callbackStarted.SetResult(true));
-
+			// Cancel on a background thread. Cancel() invokes all registered
+			// callbacks sequentially on its thread before returning.
 			Task.Run(() => cancellationSource.Cancel());
 
-			// When this returns, the internal callback is already blocked on lockObject.
+			// Wait for a monitoring callback to fire. Since Cancel() executes
+			// callbacks sequentially, the internal callback starts immediately
+			// after the monitoring one completes — on the same thread — and blocks
+			// on lockObject (which the caller holds). So when Wait() returns, the
+			// internal callback is guaranteed to be contending for the lock.
 			callbackStarted.Task.Wait();
 		};
 
 		hookProperty.SetValue(connectionService, hook);
+
+		// Return an action the caller must invoke BEFORE OpenChannelAsync to register
+		// the "early" monitoring callback (covers FIFO runtimes like .NET Framework).
+		return () => cancellationSource.Token.Register(
+			() => callbackStarted.TrySetResult(true));
 	}
 
 	[Fact]
@@ -239,7 +254,14 @@ public class ChannelTests : IDisposable
 		await this.sessionPair.ConnectAsync().WithTimeout(Timeout);
 
 		using var cancellationSource = new CancellationTokenSource();
-		InstallOpenCancelRaceHook(this.clientSession, cancellationSource);
+		var callbackStarted = new TaskCompletionSource<bool>(
+			TaskCreationOptions.RunContinuationsAsynchronously);
+		var registerEarlyCallback = InstallOpenCancelRaceHook(
+			this.clientSession, cancellationSource, callbackStarted);
+
+		// Register "early" monitoring callback BEFORE OpenChannelAsync registers
+		// the internal one. On FIFO (.NET Framework) this fires first.
+		registerEarlyCallback();
 
 		var openTask = this.clientSession.OpenChannelAsync(
 			(string)null, cancellationSource.Token);
@@ -264,7 +286,12 @@ public class ChannelTests : IDisposable
 		await this.sessionPair.ConnectAsync().WithTimeout(Timeout);
 
 		using var cancellationSource = new CancellationTokenSource();
-		InstallOpenCancelRaceHook(this.clientSession, cancellationSource);
+		var callbackStarted = new TaskCompletionSource<bool>(
+			TaskCreationOptions.RunContinuationsAsynchronously);
+		var registerEarlyCallback = InstallOpenCancelRaceHook(
+			this.clientSession, cancellationSource, callbackStarted);
+
+		registerEarlyCallback();
 
 		var racedOpenTask = this.clientSession.OpenChannelAsync(
 			(string)null, cancellationSource.Token);
