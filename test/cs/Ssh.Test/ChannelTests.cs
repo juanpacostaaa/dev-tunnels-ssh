@@ -228,9 +228,10 @@ public class ChannelTests : IDisposable
 			cancellationSource.Token.Register(
 				() => callbackStarted.TrySetResult(true));
 
-			// Cancel on a background thread. Cancel() invokes all registered
-			// callbacks sequentially on its thread before returning.
-			Task.Run(() => cancellationSource.Cancel());
+			// Cancel on a dedicated thread (not the thread pool, which can be
+			// starved under CI load). Cancel() invokes all registered callbacks
+			// sequentially on this thread before returning.
+			new Thread(() => cancellationSource.Cancel()) { IsBackground = true }.Start();
 
 			// Wait for a monitoring callback to fire. Since Cancel() executes
 			// callbacks sequentially, the internal callback starts immediately
